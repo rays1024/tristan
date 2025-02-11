@@ -27,6 +27,8 @@ from intent.intent_conditions import (
     turn_filter,
     velocity_filter,
     yield_filter,
+    road_curvature_filter,
+    intersection_filter,
 )
 from intent.multiagents.trainer_visualization import wrap_text
 from triceps.protobuf.prediction_dataset_semantic_handler import TYPE_LANGUAGE_TOKENS
@@ -38,9 +40,9 @@ from triceps.protobuf.prediction_training_pb2 import (
 )
 
 FILTER_PARAMS = {
-    "turn": {"turn_threshold": 2.0, "window_size": 5, "window_std": 10.0},
-    "velocity": {"vel_threshold": (1.0, 0.05)},
-    "acceleration": {"acc_threshold": 0.04, "window_size": 5, "window_std": 0.04},
+    "turn": {"turn_threshold": 1.0, "window_size": 10, "window_std": 10.0},
+    "velocity": {"vel_threshold": (2.1, 0.2)},
+    "acceleration": {"acc_threshold": 0.02, "window_size": 20, "window_std": 1.0},
     "lane_change": {
         "lane_threshold": 0.3,
         "skip_threshold": 2,
@@ -49,14 +51,27 @@ FILTER_PARAMS = {
         "max_lanes_in_window": 2,
         "intersection_radius": 7.5,  # Standard lane width is 3.7m in the US
     },
-    "follow": {"min_overlaps": 10},
+    "follow": {
+        "min_overlaps": 10,
+        "max_following_time": 30.0,
+    },
     "yield": {
+        "yielding_max_time": 40.0,
         "yielding_time_gap": 1,
         "yielding_prefix": 5,
         "yielding_dt": 5,
-        "yielding_dilation_radius": 0.5,
+        "yielding_dilation_radius": 0.2,
         "yielding_initial_distance": 5,
     },
+    "road_curve": {
+        "curvature_threshold": 10.0,  # Angle change in degrees to consider a curve
+        "window_size": 5,            # Number of points for detecting curvature changes
+        "min_segment_length": 10     # Minimum segment length to consider a curvature
+    },
+    "intersection": {
+        "min_segment_length": 1,      # Minimum length of trajectory segment within intersection
+        "proximity_threshold": 3.0,  # Distance to consider the ego car near an intersection
+    }
 }
 
 
@@ -282,6 +297,8 @@ class AugmentProtobufLanguage(AnnotationFunctor):
             ("lane change", lane_change_filter, filter_params["lane_change"]),
             ("velocity", velocity_filter, filter_params["velocity"]),
             ("acceleration", acceleration_filter, filter_params["acceleration"]),
+            ("road curvature", road_curvature_filter, filter_params["road_curve"]),
+            ("intersection", intersection_filter, filter_params["intersection"]),
         ]
         for name, filter, param in filters:
             scene_information = {"map_elements": map_elements}
@@ -301,10 +318,10 @@ class AugmentProtobufLanguage(AnnotationFunctor):
                 output_tokens.append(
                     TimestampedSemanticTarget(
                         timestamp_start=Timestamp(
-                            seconds=int(start_time // 1), nanos=int((start_time - start_time // 1) * 1e9)
+                            seconds=int(start_time // 1), nanos=int(max(0.000000001, round(start_time - start_time // 1, 1)) * 1e9)
                         ),
                         timestamp_end=Timestamp(
-                            seconds=int(end_time // 1), nanos=int((end_time - end_time // 1) * 1e9)
+                            seconds=int(end_time // 1), nanos=int(round(end_time - end_time // 1, 1) * 1e9)
                         ),
                         is_interval=True,
                         agent_id=target_agent_id,

@@ -2,10 +2,16 @@ import json
 from collections import OrderedDict
 from typing import Any, Tuple
 
+import cv2
 import numpy as np
 from scipy import stats
 from scipy.interpolate import interp1d
-from shapely.geometry import LinearRing, LineString, Point
+from shapely.geometry import LinearRing, LineString, Point, Polygon, MultiPolygon
+import math
+from sklearn.cluster import DBSCAN
+
+import warnings
+warnings.filterwarnings("ignore")
 
 import intent.IntentOSM as intent_osm
 
@@ -335,11 +341,26 @@ def create_duration_label(name: str, start_time: float, end_time: float, subject
     out: dict
         The output dictionary for a filter.
     """
-    out = {"label": name, "start_time": start_time, "end_time": end_time}
+    out = {"label": name, "start_time": start_time/10, "end_time": end_time/10}
     if subject is not None:
         out["subject"] = subject
     return out
 
+def interpolate_invalid_states(agent_traj):
+    traj_copy = agent_traj.copy()
+
+    invalid_mask = (traj_copy[:,0] == -1) & (traj_copy[:,1] == -1)
+
+    for i in range(1, len(traj_copy)-1):
+        if invalid_mask[i]:
+            if not invalid_mask[i-1] and not invalid_mask[i+1]:
+                x_prev, y_prev = traj_copy[i-1, 0], traj_copy[i-1, 1]
+                x_next, y_next = traj_copy[i+1, 0], traj_copy[i+1, 1]
+                traj_copy[i, 0] = (x_prev + x_next) / 2.0
+                traj_copy[i, 1] = (y_prev + y_next) / 2.0
+                invalid_mask[i] = False  # Now it's valid
+
+    return traj_copy
 
 def turn_filter(agent_trajectories: OrderedDict, scene_information: dict, params: dict) -> list:
     """Filter if the given agent is turning left or right.
@@ -443,15 +464,36 @@ def velocity_filter(agent_trajectories: OrderedDict, scene_information: dict, pa
     tokens: list
         A list of dictionaries that include label and timestamps indicating the duration for velocity mode.
     """
+
     vel_threshold = params["vel_threshold"]
     agent_traj = list(agent_trajectories.values())[0]
+    agent_traj = interpolate_invalid_states(agent_traj)
+    
     # Compute velocity.
-    velocity = np.sqrt(np.sum((agent_traj[1:] - agent_traj[:-1]) ** 2, -1))
-    velocity = np.hstack((velocity[:1], velocity))
+    velocity = []
+    for t in range(len(agent_traj)):
+        x, y = agent_traj[t, 0], agent_traj[t, 1]
+        if t == 0:
+            # For the first timestep, we can't compute a velocity yet, just put a placeholder (0 or NaN)
+            if x == -1 and y == -1:
+                velocity.append(np.nan)  # invalid
+            else:
+                velocity.append(0.0)  # no previous frame
+        else:
+            x_prev, y_prev = agent_traj[t-1, 0], agent_traj[t-1, 1]
+            if (x == -1 and y == -1) or (x_prev == -1 and y_prev == -1):
+                velocity.append(np.nan)  # invalid due to invalid data
+            else:
+                dist = np.sqrt((x - x_prev)**2 + (y - y_prev)**2)
+                velocity.append(dist)
+    velocity = np.array(velocity)
+
     tokens = []
     current_token = None
     timestamps = []
     for t in range(velocity.shape[0]):
+        if np.isnan(velocity[t]):
+            continue
         if velocity[t] >= vel_threshold[0]:
             if current_token != "MoveFast" and current_token is not None:
                 tokens.append(create_duration_label(current_token, timestamps[0], timestamps[-1]))
@@ -468,88 +510,101 @@ def velocity_filter(agent_trajectories: OrderedDict, scene_information: dict, pa
                 timestamps = []
             current_token = "Stop"
         timestamps.append(agent_traj[t][2].item())
-    if current_token is not None:
+    if current_token is not None and len(timestamps) >= 3:
         tokens.append(create_duration_label(current_token, timestamps[0], timestamps[-1]))
     return tokens
 
 
 def acceleration_filter(agent_trajectories: OrderedDict, scene_information: dict, params: dict) -> list:
-    """Filter if the given agent speeds up or slows down.
 
-    Parameters
-    ----------
-    agent_trajectories: OrderedDict
-        A map from agent_id to a Nx3 float array of positions over time, (x,y,t)
-    scene_information: dict
-        Scene information, has map_elements->OrderedDict as a field.
-    params: dict
-        The parameter dictionary for the filter, including the following keys.
-        acc_threshold: float
-            The threshold to determine if the agent speeds up/down.
-        window_size: int
-            The number of time steps to consider before and after the current time step to estimate the acceleration.
-        window_std: float
-            A point is too noisy and we don't estimate the acceleration if the standard deviation of velocity changes in a
-            window is larger than this number.
+    def smooth_signal(signal, window_size=5):
+        if window_size == 0:
+            return signal
+        smoothed = np.copy(signal)
+        n = len(signal)
+        for i in range(n):
+            start = max(0, i - window_size)
+            end = min(n, i + window_size + 1)
+            if start >= end or np.all(np.isnan(signal[start:end])):
+                smoothed[i] = np.nan
+            else:
+                smoothed[i] = np.nanmean(signal[start:end])        
+        return smoothed
 
-    Returns
-    -------
-    tokens: list
-        A list of dictionaries that include label and timestamps indicating the duration for acceleration mode.
-    """
-    acc_threshold = params["acc_threshold"]
-    window_size = params["window_size"]
-    window_std = params["window_std"]
+    acc_threshold = params.get("acc_threshold", 0.02)      # Threshold for acceleration/deceleration
+    smoothing_window = params.get("smoothing_window", 5) # Half-window for smoothing
+
     agent_traj = list(agent_trajectories.values())[0]
-    # Compute velocity.
-    velocity = np.sqrt(np.sum((agent_traj[1:] - agent_traj[:-1]) ** 2, -1))
-    velocity = np.hstack((velocity[:1], velocity))
-    # Compute acceleration
-    acceleration = velocity[1:] - velocity[:-1]
-    acceleration = np.hstack((acceleration, acceleration[-1:]))
-    # Compute acceleration for all time steps.
-    tokens = []
-    current_token = None
-    timestamps = []
-    for t in range(velocity.shape[0]):
-        t_start = t - window_size if t - window_size > 0 else 0
-        t_end = t + window_size if t + window_size < velocity.shape[0] else velocity.shape[0]
-        acc_before = acceleration[t_start:t]
-        if len(acc_before) == 0:
-            continue
-        acc_after = acceleration[t:t_end]
-        mean_before = acc_before.mean()
-        std_bfore = acc_before.std()
-        mean_after = acc_after.mean()
-        std_after = acc_after.std()
-        # print(agent_id, t, mean_before, std_bfore, mean_after, std_after)
-        if std_bfore > window_std or std_after > window_std:
-            # Uncertain if the angular velocity changes too much.
-            if current_token is not None:
-                tokens.append(create_duration_label(current_token, timestamps[0], timestamps[-1]))
-                current_token = None
-                timestamps = []
-        elif mean_before >= 1.0 * acc_threshold and mean_after >= 1.0 * acc_threshold:
-            # Turning left if keep moving toward left.
-            if current_token != "SpeedUp" and current_token is not None:
-                tokens.append(create_duration_label(current_token, timestamps[0], timestamps[-1]))
-                timestamps = []
-            current_token = "SpeedUp"
-            timestamps.append(agent_traj[t][2].item())
-        elif mean_before <= -1.0 * acc_threshold and mean_after <= -1.0 * acc_threshold:
-            # Turning left if keep moving toward right.
-            if current_token != "SlowDown" and current_token is not None:
-                tokens.append(create_duration_label(current_token, timestamps[0], timestamps[-1]))
-                timestamps = []
-            current_token = "SlowDown"
-            timestamps.append(agent_traj[t][2].item())
+    agent_traj = interpolate_invalid_states(agent_traj)
+    
+    velocity = []
+    for t in range(len(agent_traj)):
+        x, y = agent_traj[t, 0], agent_traj[t, 1]
+        if t == 0:
+            if x == -1 and y == -1:
+                velocity.append(np.nan)
+            else:
+                velocity.append(0.0)
         else:
-            if current_token is not None:
-                tokens.append(create_duration_label(current_token, timestamps[0], timestamps[-1]))
-                current_token = None
-                timestamps = []
-    if current_token is not None:
-        tokens.append(create_duration_label(current_token, timestamps[0], timestamps[-1]))
+            x_prev, y_prev = agent_traj[t-1, 0], agent_traj[t-1, 1]
+            if (x == -1 and y == -1) or (x_prev == -1 and y_prev == -1):
+                velocity.append(np.nan)
+            else:
+                dist = np.sqrt((x - x_prev)**2 + (y - y_prev)**2)
+                velocity.append(dist)
+    velocity = np.array(velocity)
+
+    # Compute acceleration
+    acceleration = []
+    for t in range(len(velocity)):
+        if t == 0:
+            acceleration.append(np.nan)
+        else:
+            v_curr = velocity[t]
+            v_prev = velocity[t-1]
+            if np.isnan(v_curr) or np.isnan(v_prev):
+                acceleration.append(np.nan)
+            else:
+                acceleration.append(v_curr - v_prev)
+    acceleration = np.array(acceleration)
+
+    # Smooth the acceleration to reduce jitter.
+    acceleration = smooth_signal(acceleration, smoothing_window)
+
+    labels = []
+    for a in acceleration:
+        if np.isnan(a):
+            labels.append("ConstantSpeed")
+        elif a > acc_threshold:
+            labels.append("SpeedUp")
+        elif a < -acc_threshold:
+            labels.append("SlowDown")
+        else:
+            labels.append("ConstantSpeed")
+
+    intervals = []
+    current_label = labels[0]
+    start_idx = 0
+
+    for i, value in enumerate(labels):
+        if i > 0 and i < len(labels)-1 and value != labels[i-1] and value != labels[i+1]:
+            labels[i] = labels[i-1]
+
+    for i in range(1, len(labels)):
+        if labels[i] != current_label:
+            # Found a boundary
+            intervals.append((current_label, start_idx, i-1))
+            current_label = labels[i]
+            start_idx = i
+    intervals.append((current_label, start_idx, len(labels)-1))
+
+    # Convert intervals to tokens
+    tokens = []
+    for (label, s, e) in intervals:
+        start_time = agent_traj[s][2].item()
+        end_time = agent_traj[e][2].item()
+        tokens.append(create_duration_label(label, start_time, end_time))
+
     return tokens
 
 
@@ -742,18 +797,20 @@ def lane_change_filter(agent_trajectories: OrderedDict, scene_information: dict,
 
 
 def follow_filter(agent_trajectories: OrderedDict, scene_information: dict, params: dict):
-    """Filter if the agent follows other agents.
+    """Filter if the agent follows other agents within a specific distance.
 
     Parameters
     ----------
     agent_trajectories: OrderedDict
-        A map from agent_id to a Nx3 float array of positions over time, (x,y,t)
+        A map from agent_id to a Nx3 float array of positions over time, (x,y,t).
     scene_information: dict
         Scene information, has map_elements->OrderedDict as a field.
     params: dict
-        The parameter dictionary for the filter, including the following keys.
-        min_overlaps: int
+        The parameter dictionary for the filter, including the following keys:
+        - min_overlaps: int
             The minimum overlapping time steps for computing 'follow'.
+        - max_following_distance: float
+            The maximum distance within which an agent is considered to be "following" another.
 
     Returns
     -------
@@ -761,12 +818,14 @@ def follow_filter(agent_trajectories: OrderedDict, scene_information: dict, para
         A list of dictionaries indicating the duration when "follow" is true and which agent is followed.
     """
     min_overlaps = params["min_overlaps"]
+    max_following_time = params["max_following_time"]
     target_agent_id = list(agent_trajectories.keys())[0]
     target_agent_traj = agent_trajectories[target_agent_id]
     target_traj_length = target_agent_traj.shape[0]
     other_agent_ids = [agent_i for agent_i in agent_trajectories.keys() if agent_i != target_agent_id]
     target_ls = LineString(target_agent_traj[:, :2]).buffer(0.5)
     tokens = []
+
     for other_agent_id in other_agent_ids:
         # Compute the overlapping area of two trajectories.
         other_agent_traj = agent_trajectories[other_agent_id]
@@ -774,6 +833,7 @@ def follow_filter(agent_trajectories: OrderedDict, scene_information: dict, para
         overlaps = target_ls.intersection(other_ls)
         if overlaps.area == 0:
             continue
+
         # Get the points in the overlapping area.
         target_overlap = [
             target_agent_traj[t]
@@ -785,16 +845,27 @@ def follow_filter(agent_trajectories: OrderedDict, scene_information: dict, para
             for t in range(other_agent_traj.shape[0])
             if overlaps.contains(Point(other_agent_traj[t, :2]))
         ]
-        # It is following if the trajectory of the two agents overlaps and the other agent arrives
-        # the overlapping ara earlier.
+
+        # Check for following conditions: overlap length, arrival time, and distance constraint
         if (
             len(target_overlap) > min_overlaps
             and len(other_overlap) > min_overlaps
             and other_overlap[0][2] < target_overlap[0][2]
         ):
-            tokens.append(
-                create_duration_label("Follow", target_overlap[0][2], target_overlap[-1][2], subject=other_agent_id)
-            )
+            # Verify if the following distance constraint is met throughout the overlap period
+            following = True
+            for t in range(min(len(target_overlap), len(other_overlap))): 
+                if target_overlap[t][0] < 0 or target_overlap[t][1] < 0 or other_overlap[t][0] < 0 or other_overlap[t][1] < 0:
+                    break
+                if target_overlap[t][2] - other_overlap[t][2] > max_following_time:
+                    following = False
+                    break
+            
+            if following and t > 1:
+                tokens.append(
+                    create_duration_label("Follow", target_overlap[0][2], target_overlap[t][2], subject=other_agent_id)
+                )
+
     return tokens
 
 
@@ -853,7 +924,11 @@ def yield_filter(agent_trajectories: OrderedDict, scene_information: OrderedDict
 
     target_agent_id = list(agent_trajectories.keys())[0]
     target_agent_traj = agent_trajectories[target_agent_id]
+    mask = (target_agent_traj[:, 0] >= 0) & (target_agent_traj[:, 1] >= 0)
+    target_agent_traj = target_agent_traj[mask]
+
     yielding_dilation_radius = params["yielding_dilation_radius"]
+    yielding_max_time = params["yielding_max_time"]
 
     positions1, spd1, t1, sl1 = compute_trajectory_stats(target_agent_traj, yielding_dilation_radius)
 
@@ -861,8 +936,31 @@ def yield_filter(agent_trajectories: OrderedDict, scene_information: OrderedDict
     other_agent_ids = [agent_i for agent_i in agent_trajectories.keys() if agent_i != target_agent_id]
     for other_agent_id in other_agent_ids:
         other_agent_traj = agent_trajectories[other_agent_id]
+        mask = (other_agent_traj[:, 0] >= 0) & (other_agent_traj[:, 1] >= 0)
+        other_agent_traj = other_agent_traj[mask]
+        if len(other_agent_traj) < 2:
+            continue
         positions2, spd2, t2, sl2 = compute_trajectory_stats(other_agent_traj, yielding_dilation_radius)
         intersection = sl1.intersection(sl2)
+
+        target_overlap = [
+            target_agent_traj[t]
+            for t in range(target_agent_traj.shape[0])
+            if intersection.contains(Point(target_agent_traj[t, :2]))
+        ]
+        other_overlap = [
+            other_agent_traj[t]
+            for t in range(other_agent_traj.shape[0])
+            if intersection.contains(Point(other_agent_traj[t, :2]))
+        ]
+        near = True
+        for t in range(min(len(target_overlap), len(other_overlap))): 
+            if target_overlap[t][2] - other_overlap[t][2] > yielding_max_time:
+                near = False
+                break
+        if not near:
+            continue
+
         idxs1 = find_points_in_region(positions1, intersection)
         idxs2 = find_points_in_region(positions2, intersection)
         if len(idxs1) == 0 or len(idxs2) == 0:
@@ -1012,4 +1110,223 @@ def ttc_filter(agent_trajectories: OrderedDict, scene_information: OrderedDict, 
                 create_duration_label("TTC", start_time=start_time, end_time=end_time, subject=other_agent_id)
             )
 
+    return tokens
+
+def road_curvature_filter(agent_trajectories: OrderedDict, scene_information: dict, params: dict) -> list:
+    """
+    Filter if the road is curving and in which direction (left or right).
+
+    Parameters
+    ----------
+    agent_trajectories : OrderedDict
+        A map from agent_id to a Nx3 float array of positions over time, (x, y, t).
+    scene_information : dict
+        Scene information, containing map elements such as lane center lines.
+    params : dict
+        Parameters for the filter, including:
+        curvature_threshold: float
+            Minimum angle change to consider as curvature.
+        window_size: int
+            Number of steps to use in calculating directional changes.
+        min_segment_length: int
+            Minimum number of points to consider a segment as curved.
+
+    Returns
+    -------
+    tokens : list
+        List of dictionaries with curvature labels and timestamps indicating curving segments.
+    """
+    curvature_threshold = params["curvature_threshold"]
+    window_size = params["window_size"]
+    min_segment_length = params["min_segment_length"]
+    
+    agent_traj = list(agent_trajectories.values())[0]
+    traj_length = len(agent_traj)
+    map_elements = scene_information["map_elements"]
+    lane_centers = map_elements["lane_centers"]
+    
+    # Convert lane center coordinates to LineString objects
+    ls_lane_centers = [LineString(lane) for lane in lane_centers]
+    tokens = []
+    current_token = None
+    timestamps = []
+    
+    def get_closest_lane_point(pos: Point):
+        """Get the closest point on lane centers from a position."""
+        min_dist = float("inf")
+        closest_point = None
+        for lane in ls_lane_centers:
+            point_on_lane = lane.interpolate(lane.project(pos))
+            dist = pos.distance(point_on_lane)
+            if dist < min_dist:
+                min_dist = dist
+                closest_point = point_on_lane
+        return closest_point
+    
+    def calculate_directional_change(p1: Point, p2: Point, p3: Point) -> float:
+        """Calculate signed angle change from (p1->p2) to (p2->p3) in degrees."""
+        v1 = np.array([p2.x - p1.x, p2.y - p1.y])
+        v2 = np.array([p3.x - p2.x, p3.y - p2.y])
+        angle = np.degrees(np.arctan2(v2[1], v2[0]) - np.arctan2(v1[1], v1[0]))
+        return angle
+    
+    for t in range(window_size, traj_length - window_size):
+        pt_ego = Point(agent_traj[t, :2])
+        pt_prev = Point(agent_traj[t - window_size, :2])
+        pt_next = Point(agent_traj[t + window_size, :2])
+        
+        closest_point = get_closest_lane_point(pt_ego)
+        angle_change = calculate_directional_change(pt_prev, pt_ego, pt_next)
+        
+        if abs(angle_change) > curvature_threshold:
+            direction = "RoadCurveLeft" if angle_change > 0 else "RoadCurveRight"
+            if current_token != direction:
+                if current_token is not None and len(timestamps) >= min_segment_length:
+                    tokens.append(create_duration_label(current_token, timestamps[0], timestamps[-1]))
+                    timestamps = []
+                current_token = direction
+            timestamps.append(agent_traj[t, 2].item())
+        else:
+            if current_token is not None and len(timestamps) >= min_segment_length:
+                tokens.append(create_duration_label(current_token, timestamps[0], timestamps[-1]))
+                timestamps = []
+                current_token = None
+
+    if current_token is not None and len(timestamps) >= min_segment_length:
+        tokens.append(create_duration_label(current_token, timestamps[0], timestamps[-1]))
+    
+    return tokens
+
+def intersection_filter(agent_trajectories: OrderedDict, scene_information: dict, params: dict) -> list:
+
+    def points_to_polygons(points, eps=5):
+        points = np.array(points)  # Ensure input is a NumPy array
+
+        # Step 1: Cluster points using DBSCAN
+        dbscan = DBSCAN(eps=eps, min_samples=1)
+        labels = dbscan.fit_predict(points)
+
+        polygons = []
+
+        # Step 2: Process each cluster
+        for cluster_label in set(labels):
+            cluster_points = points[labels == cluster_label]
+
+            # Skip clusters with fewer than 3 points (cannot form a polygon)
+            if len(cluster_points) < 3:
+                continue
+
+            # Compute the minimum area rectangle using OpenCV
+            rect = cv2.minAreaRect(cluster_points.astype('float32'))
+            box = cv2.boxPoints(rect)  # Extract rectangle vertices
+            box = np.int0(box)         # Convert to integer coordinates
+
+            # Create a shapely polygon from the rectangle vertices
+            polygon = Polygon(box)
+
+            # Ensure the polygon is valid (e.g., close the loop)
+            if polygon.is_valid:
+                polygons.append(polygon)
+
+        return polygons
+
+    min_segment_length = params["min_segment_length"]
+    proximity_threshold = params["proximity_threshold"]
+    
+    # Extract ego trajectory
+    agent_traj = list(agent_trajectories.values())[0]
+    traj_length = len(agent_traj)
+    
+    map_elements = scene_information["map_elements"]
+    crosswalks = map_elements.get("crosswalks", [])
+    stop_signs = map_elements.get("stop_signs", [])
+
+    if not crosswalks:
+        # No crosswalks, no intersection
+        return []
+
+    flattened_crosswalk = [item for sublist in crosswalks for item in sublist]
+    intersection_polygon = points_to_polygons(flattened_crosswalk)
+
+    # Now detect when the ego is inside or outside this intersection_polygon
+    tokens = []
+    inside_intersection = False
+    timestamps = []
+    current_label = None
+
+    if intersection_polygon:
+        for t in range(traj_length):
+            pt_ego = Point(agent_traj[t, :2])
+            current_time = agent_traj[t, 2].item()
+
+            # Check if ego is inside the intersection polygon
+            for polygon in intersection_polygon:
+                is_inside = polygon.contains(pt_ego)
+                if is_inside:
+                    break
+
+            if is_inside and not inside_intersection:
+                # Entering intersection
+                inside_intersection = True
+                current_label = "Intersection"
+                timestamps = [current_time]
+            elif not is_inside and inside_intersection:
+                # Leaving intersection
+                inside_intersection = False
+                timestamps.append(current_time)
+                if len(timestamps) >= min_segment_length:
+                    tokens.append(create_duration_label(current_label, timestamps[0], timestamps[-1]))
+                current_label = None
+                timestamps = []
+            elif is_inside and inside_intersection:
+                # Still inside intersection
+                timestamps.append(current_time)
+            else:
+                # Outside and staying outside
+                pass
+
+        # If ended inside intersection
+        if inside_intersection and len(timestamps) >= min_segment_length:
+            tokens.append(create_duration_label("Intersection", timestamps[0], timestamps[-1]))
+
+    def is_near_stopsign(ego_pos: Point, stop_sign_positions: list, threshold: float) -> bool:
+        """Check if ego_pos is within threshold distance of any stop sign."""
+        for sign in stop_sign_positions:
+            for s in sign:
+                # Each 's' is a point (x, y) for the stop sign
+                if ego_pos.distance(Point(s)) <= threshold:
+                    return True
+        return False
+
+    # Detect when the ego car enters and leaves the stop sign circle
+    inside_stopsign_area = False
+    timestamps_stopsign = []
+
+    for t in range(traj_length):
+        pt_ego = Point(agent_traj[t, :2])
+        current_time = agent_traj[t, 2].item()
+        near_stopsign = is_near_stopsign(pt_ego, stop_signs, proximity_threshold)
+        
+        if near_stopsign and not inside_stopsign_area:
+            # Just entered stop sign area
+            inside_stopsign_area = True
+            timestamps_stopsign = [current_time]
+        elif not near_stopsign and inside_stopsign_area:
+            # Just exited stop sign area
+            inside_stopsign_area = False
+            timestamps_stopsign.append(current_time)
+            if len(timestamps_stopsign) >= min_segment_length:
+                tokens.append(create_duration_label("StopSign", timestamps_stopsign[0], timestamps_stopsign[-1]))
+            timestamps_stopsign = []
+        elif near_stopsign and inside_stopsign_area:
+            # Still inside stop sign area
+            timestamps_stopsign.append(current_time)
+        else:
+            # Outside and remains outside
+            pass
+
+    # If ended while still inside stop sign area
+    if inside_stopsign_area and len(timestamps_stopsign) >= min_segment_length:
+        tokens.append(create_duration_label("StopSign", timestamps_stopsign[0], timestamps_stopsign[-1]))
+    
     return tokens
